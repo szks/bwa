@@ -1,6 +1,23 @@
-CC=			gcc
-#CC=			clang --analyze
-CFLAGS=		-g -Wall -Wno-unused-function -O2
+#########################################################
+# Fujitsu compiler
+
+CC = fccpx
+
+### trad mode ####
+#CFLAGS = -Kfast
+#CFLAGS += -Ksimd_reg_size=128
+##CFLAGS += -Ksimd_reg_size=256 -DBWA_SVE_VL=32
+##CFLAGS += -Nlst=t -Koptmsg=2
+
+### clang mode ###
+CFLAGS = -Nclang -Ofast
+#CFLAGS += -DBWA_SVE_VL=32
+
+#########################################################
+
+#CFLAGS += -DFIX_SECOND_BEST
+
+
 WRAP_MALLOC=-DUSE_MALLOC_WRAPPERS
 AR=			ar
 DFLAGS=		-DHAVE_PTHREAD $(WRAP_MALLOC)
@@ -86,3 +103,5 @@ pemerge.o: ksw.h kseq.h malloc_wrap.h kstring.h bwa.h bntseq.h bwt.h utils.h
 rle.o: rle.h
 rope.o: rle.h rope.h
 utils.o: utils.h ksort.h malloc_wrap.h kseq.h
+
+ksw.o: ksw_sve.h

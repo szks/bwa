@@ -1,5 +1,27 @@
 /* The MIT License
 
+Copyright (c) 2021 RIKEN R-CCS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Here is the copyright notice for the original SSE2 version of ksw.c:
+
    Copyright (c) 2011 by Attractive Chaos <attractor@live.co.uk>
 
    Permission is hereby granted, free of charge, to any person obtaining
@@ -26,8 +48,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
-#include <emmintrin.h>
 #include "ksw.h"
+#include "ksw_sve.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -45,8 +67,12 @@ const kswr_t g_defr = { 0, -1, -1, -1, -1, -1, -1 };
 
 struct _kswq_t {
 	int qlen, slen;
+	int p;
 	uint8_t shift, mdiff, max, size;
-	__m128i *qp, *H0, *H1, *E, *Hmax;
+	_vec *qp, *H0, *H1, *E, *Hmax;
+#ifdef FIX_SECOND_BEST
+	int *nelement;
+#endif
 };
 
 /**
@@ -66,15 +92,24 @@ kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const int8_t 
 	int slen, a, tmp, p;
 
 	size = size > 1? 2 : 1;
-	p = 8 * (3 - size); // # values per __m128i
+	p = BWA_SVE_VL / size;
 	slen = (qlen + p - 1) / p; // segmented length
-	q = (kswq_t*)malloc(sizeof(kswq_t) + 256 + 16 * slen * (m + 4)); // a single block of memory
-	q->qp = (__m128i*)(((size_t)q + sizeof(kswq_t) + 15) >> 4 << 4); // align memory
+#ifdef FIX_SECOND_BEST
+	q = (kswq_t*)malloc(sizeof(kswq_t) + 256 + BWA_SVE_VL * slen * (m + 4)
+	                                   + slen * sizeof(int)); // a single block of memory
+#else
+	q = (kswq_t*)malloc(sizeof(kswq_t) + 256 + BWA_SVE_VL * slen * (m + 4)); // a single block of memory
+#endif
+	q->qp = (_vec*)(((size_t)q + sizeof(kswq_t) + 15) >> 4 << 4); // align memory
 	q->H0 = q->qp + slen * m;
 	q->H1 = q->H0 + slen;
 	q->E  = q->H1 + slen;
 	q->Hmax = q->E + slen;
+#ifdef FIX_SECOND_BEST
+	q->nelement = (int*)(q->Hmax + slen);
+#endif
 	q->slen = slen; q->qlen = qlen; q->size = size;
+	q->p = p;
 	// compute shift
 	tmp = m * m;
 	for (a = 0, q->shift = 127, q->mdiff = 0; a < tmp; ++a) { // find the minimum and maximum score
@@ -105,90 +140,115 @@ kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const int8_t 
 					*t++ = (k >= qlen? 0 : ma[query[k]]);
 		}
 	}
+#ifdef FIX_SECOND_BEST
+	int i, i0, j0;   /* k = j*slen + i */
+	j0 = qlen / slen;
+	i0 = qlen % slen;
+	for (i = 0; i < slen; ++i) {
+		if (i < i0) {
+			q->nelement[i] = j0 + 1;
+		} else {
+			q->nelement[i] = j0;
+		}
+	}
+#endif
 	return q;
 }
 
 kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del, int _o_ins, int _e_ins, int xtra) // the first gap costs -(_o+_e)
 {
 	int slen, i, m_b, n_b, te = -1, gmax = 0, minsc, endsc;
+	int p;
 	uint64_t *b;
-	__m128i zero, oe_del, e_del, oe_ins, e_ins, shift, *H0, *H1, *E, *Hmax;
+	svuint8_t zero, oe_del, e_del, oe_ins, e_ins, shift;
+	_vec *H0, *H1, *E, *Hmax;
+#ifdef FIX_SECOND_BEST
+	int *nelement;
+#endif
 	kswr_t r;
 
-#define __max_16(ret, xx) do { \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 8)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 4)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 2)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 1)); \
-    	(ret) = _mm_extract_epi16((xx), 0) & 0x00ff; \
-	} while (0)
+	sve_u8_init();
 
 	// initialization
 	r = g_defr;
 	minsc = (xtra&KSW_XSUBO)? xtra&0xffff : 0x10000;
 	endsc = (xtra&KSW_XSTOP)? xtra&0xffff : 0x10000;
 	m_b = n_b = 0; b = 0;
-	zero = _mm_set1_epi32(0);
-	oe_del = _mm_set1_epi8(_o_del + _e_del);
-	e_del = _mm_set1_epi8(_e_del);
-	oe_ins = _mm_set1_epi8(_o_ins + _e_ins);
-	e_ins = _mm_set1_epi8(_e_ins);
-	shift = _mm_set1_epi8(q->shift);
+	zero = _SET1_u8(0);
+	oe_del = _SET1_u8(_o_del + _e_del);
+	e_del = _SET1_u8(_e_del);
+	oe_ins = _SET1_u8(_o_ins + _e_ins);
+	e_ins = _SET1_u8(_e_ins);
+	shift = _SET1_u8(q->shift);
 	H0 = q->H0; H1 = q->H1; E = q->E; Hmax = q->Hmax;
+#ifdef FIX_SECOND_BEST
+	nelement = q->nelement;
+#endif
 	slen = q->slen;
+	p = q->p;
 	for (i = 0; i < slen; ++i) {
-		_mm_store_si128(E + i, zero);
-		_mm_store_si128(H0 + i, zero);
-		_mm_store_si128(Hmax + i, zero);
+		_STORE_u8(E + i, zero);
+		_STORE_u8(H0 + i, zero);
+		_STORE_u8(Hmax + i, zero);
 	}
 	// the core loop
 	for (i = 0; i < tlen; ++i) {
 		int j, k, cmp, imax;
-		__m128i e, h, t, f = zero, max = zero, *S = q->qp + target[i] * slen; // s is the 1st score vector
-		h = _mm_load_si128(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
-		h = _mm_slli_si128(h, 1); // h=H(i-1,-1); << instead of >> because x64 is little-endian
+		_vec *S = q->qp + target[i] * slen; // s is the 1st score vector
+		svuint8_t e, h, t, f = zero, max = zero;
+#ifdef FIX_SECOND_BEST
+		svbool_t mask;
+#endif
+		h = _LOAD_u8(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
+		h = _SHIFT_L_u8(h); // h=H(i-1,-1);
 		for (j = 0; LIKELY(j < slen); ++j) {
 			/* SW cells are computed in the following order:
 			 *   H(i,j)   = max{H(i-1,j-1)+S(i,j), E(i,j), F(i,j)}
 			 *   E(i+1,j) = max{H(i,j)-q, E(i,j)-r}
 			 *   F(i,j+1) = max{H(i,j)-q, F(i,j)-r}
 			 */
+#ifdef FIX_SECOND_BEST
+			mask = svwhilelt_b8(0, nelement[j]);
+#endif
 			// compute H'(i,j); note that at the beginning, h=H'(i-1,j-1)
-			h = _mm_adds_epu8(h, _mm_load_si128(S + j));
-			h = _mm_subs_epu8(h, shift); // h=H'(i-1,j-1)+S(i,j)
-			e = _mm_load_si128(E + j); // e=E'(i,j)
-			h = _mm_max_epu8(h, e);
-			h = _mm_max_epu8(h, f); // h=H'(i,j)
-			max = _mm_max_epu8(max, h); // set max
-			_mm_store_si128(H1 + j, h); // save to H'(i,j)
+			h = _ADD_u8(h, _LOAD_u8(S + j));
+			h = _SUB_u8(h, shift); // h=H'(i-1,j-1)+S(i,j)
+			e = _LOAD_u8(E + j); // e=E'(i,j)
+			h = _MAX_u8(h, e);
+			h = _MAX_u8(h, f); // h=H'(i,j)
+#ifdef FIX_SECOND_BEST
+			max = _MAXm_u8(mask, max, h); // set max
+#else
+			max = _MAX_u8(max, h); // set max
+#endif
+			_STORE_u8(H1 + j, h); // save to H'(i,j)
 			// now compute E'(i+1,j)
-			e = _mm_subs_epu8(e, e_del); // e=E'(i,j) - e_del
-			t = _mm_subs_epu8(h, oe_del); // h=H'(i,j) - o_del - e_del
-			e = _mm_max_epu8(e, t); // e=E'(i+1,j)
-			_mm_store_si128(E + j, e); // save to E'(i+1,j)
+			e = _SUB_u8(e, e_del); // e=E'(i,j) - e_del
+			t = _SUB_u8(h, oe_del); // h=H'(i,j) - o_del - e_del
+			e = _MAX_u8(e, t); // e=E'(i+1,j)
+			_STORE_u8(E + j, e); // save to E'(i+1,j)
 			// now compute F'(i,j+1)
-			f = _mm_subs_epu8(f, e_ins);
-			t = _mm_subs_epu8(h, oe_ins); // h=H'(i,j) - o_ins - e_ins
-			f = _mm_max_epu8(f, t);
+			f = _SUB_u8(f, e_ins);
+			t = _SUB_u8(h, oe_ins); // h=H'(i,j) - o_ins - e_ins
+			f = _MAX_u8(f, t);
 			// get H'(i-1,j) and prepare for the next j
-			h = _mm_load_si128(H0 + j); // h=H'(i-1,j)
+			h = _LOAD_u8(H0 + j); // h=H'(i-1,j)
 		}
 		// NB: we do not need to set E(i,j) as we disallow adjecent insertion and then deletion
-		for (k = 0; LIKELY(k < 16); ++k) { // this block mimics SWPS3; NB: H(i,j) updated in the lazy-F loop cannot exceed max
-			f = _mm_slli_si128(f, 1);
+		for (k = 0; LIKELY(k < p); ++k) { // this block mimics SWPS3; NB: H(i,j) updated in the lazy-F loop cannot exceed max
+			f = _SHIFT_L_u8(f);
 			for (j = 0; LIKELY(j < slen); ++j) {
-				h = _mm_load_si128(H1 + j);
-				h = _mm_max_epu8(h, f); // h=H'(i,j)
-				_mm_store_si128(H1 + j, h);
-				h = _mm_subs_epu8(h, oe_ins);
-				f = _mm_subs_epu8(f, e_ins);
-				cmp = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(f, h), zero));
-				if (UNLIKELY(cmp == 0xffff)) goto end_loop16;
+				h = _LOAD_u8(H1 + j);
+				h = _MAX_u8(h, f); // h=H'(i,j)
+				_STORE_u8(H1 + j, h);
+				h = _SUB_u8(h, oe_ins);
+				f = _SUB_u8(f, e_ins);
+				cmp = _CMP_LE_ALL_u8(f, h);
+				if (UNLIKELY(cmp)) goto end_loop_u8;
 			}
 		}
-end_loop16:
-		//int k;for (k=0;k<16;++k)printf("%d ", ((uint8_t*)&max)[k]);printf("\n");
-		__max_16(imax, max); // imax is the maximum number in max
+end_loop_u8:
+		imax = _MAX_V_u8(max); // imax is the maximum number in max
 		if (imax >= minsc) { // write the b array; this condition adds branching unfornately
 			if (n_b == 0 || (int32_t)b[n_b-1] + 1 != i) { // then append
 				if (n_b == m_b) {
@@ -201,7 +261,7 @@ end_loop16:
 		if (imax > gmax) {
 			gmax = imax; te = i; // te is the end position on the target
 			for (j = 0; LIKELY(j < slen); ++j) // keep the H1 vector
-				_mm_store_si128(Hmax + j, _mm_load_si128(H1 + j));
+				_STORE_u8(Hmax + j, _LOAD_u8(H1 + j));
 			if (gmax + q->shift >= 255 || gmax >= endsc) break;
 		}
 		S = H1; H1 = H0; H0 = S; // swap H0 and H1
@@ -209,11 +269,11 @@ end_loop16:
 	r.score = gmax + q->shift < 255? gmax : 255;
 	r.te = te;
 	if (r.score != 255) { // get a->qe, the end of query match; find the 2nd best score
-		int max = -1, tmp, low, high, qlen = slen * 16;
+		int max = -1, tmp, low, high, qlen = slen * p;
 		uint8_t *t = (uint8_t*)Hmax;
 		for (i = 0; i < qlen; ++i, ++t)
-			if ((int)*t > max) max = *t, r.qe = i / 16 + i % 16 * slen;
-			else if ((int)*t == max && (tmp = i / 16 + i % 16 * slen) < r.qe) r.qe = tmp; 
+			if ((int)*t > max) max = *t, r.qe = i / p + i % p * slen;
+			else if ((int)*t == max && (tmp = i / p + i % p * slen) < r.qe) r.qe = tmp; 
 		//printf("%d,%d\n", max, gmax);
 		if (b) {
 			i = (r.score + q->max - 1) / q->max;
@@ -232,69 +292,85 @@ end_loop16:
 kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del, int _o_ins, int _e_ins, int xtra) // the first gap costs -(_o+_e)
 {
 	int slen, i, m_b, n_b, te = -1, gmax = 0, minsc, endsc;
+	int p;
 	uint64_t *b;
-	__m128i zero, oe_del, e_del, oe_ins, e_ins, *H0, *H1, *E, *Hmax;
+	svint16_t zero, oe_del, e_del, oe_ins, e_ins;
+	_vec *H0, *H1, *E, *Hmax;
+#ifdef FIX_SECOND_BEST
+	int *nelement;
+#endif
 	kswr_t r;
 
-#define __max_8(ret, xx) do { \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 8)); \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 4)); \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 2)); \
-    	(ret) = _mm_extract_epi16((xx), 0); \
-	} while (0)
+	sve_i16_init();
 
 	// initialization
 	r = g_defr;
 	minsc = (xtra&KSW_XSUBO)? xtra&0xffff : 0x10000;
 	endsc = (xtra&KSW_XSTOP)? xtra&0xffff : 0x10000;
 	m_b = n_b = 0; b = 0;
-	zero = _mm_set1_epi32(0);
-	oe_del = _mm_set1_epi16(_o_del + _e_del);
-	e_del = _mm_set1_epi16(_e_del);
-	oe_ins = _mm_set1_epi16(_o_ins + _e_ins);
-	e_ins = _mm_set1_epi16(_e_ins);
+	zero = _SET1_i16(0);
+	oe_del = _SET1_i16(_o_del + _e_del);
+	e_del = _SET1_i16(_e_del);
+	oe_ins = _SET1_i16(_o_ins + _e_ins);
+	e_ins = _SET1_i16(_e_ins);
 	H0 = q->H0; H1 = q->H1; E = q->E; Hmax = q->Hmax;
+#ifdef FIX_SECOND_BEST
+	nelement = q->nelement;
+#endif
 	slen = q->slen;
+	p = q->p;
 	for (i = 0; i < slen; ++i) {
-		_mm_store_si128(E + i, zero);
-		_mm_store_si128(H0 + i, zero);
-		_mm_store_si128(Hmax + i, zero);
+		_STORE_i16(E + i, zero);
+		_STORE_i16(H0 + i, zero);
+		_STORE_i16(Hmax + i, zero);
 	}
 	// the core loop
 	for (i = 0; i < tlen; ++i) {
-		int j, k, imax;
-		__m128i e, t, h, f = zero, max = zero, *S = q->qp + target[i] * slen; // s is the 1st score vector
-		h = _mm_load_si128(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
-		h = _mm_slli_si128(h, 2);
+		int j, k, cmp, imax;
+		_vec *S = q->qp + target[i] * slen; // s is the 1st score vector
+		svint16_t e, h, t, f = zero, max = zero;
+#ifdef FIX_SECOND_BEST
+		svbool_t mask;
+#endif
+		h = _LOAD_i16(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
+		h = _SHIFT_L_i16(h);
 		for (j = 0; LIKELY(j < slen); ++j) {
-			h = _mm_adds_epi16(h, *S++);
-			e = _mm_load_si128(E + j);
-			h = _mm_max_epi16(h, e);
-			h = _mm_max_epi16(h, f);
-			max = _mm_max_epi16(max, h);
-			_mm_store_si128(H1 + j, h);
-			e = _mm_subs_epu16(e, e_del);
-			t = _mm_subs_epu16(h, oe_del);
-			e = _mm_max_epi16(e, t);
-			_mm_store_si128(E + j, e);
-			f = _mm_subs_epu16(f, e_ins);
-			t = _mm_subs_epu16(h, oe_ins);
-			f = _mm_max_epi16(f, t);
-			h = _mm_load_si128(H0 + j);
+#ifdef FIX_SECOND_BEST
+			mask = svwhilelt_b16(0, nelement[j]);
+#endif
+			h = _ADD_i16(h, _LOAD_i16(S + j));
+			e = _LOAD_i16(E + j);
+			h = _MAX_i16(h, e);
+			h = _MAX_i16(h, f);
+#ifdef FIX_SECOND_BEST
+			max = _MAXm_i16(mask, max, h);
+#else
+			max = _MAX_i16(max, h);
+#endif
+			_STORE_i16(H1 + j, h);
+			e = _SUB_i16(e, e_del);
+			t = _SUB_i16(h, oe_del);
+			e = _MAX_i16(e, t);
+			_STORE_i16(E + j, e);
+			f = _SUB_i16(f, e_ins);
+			t = _SUB_i16(h, oe_ins);
+			f = _MAX_i16(f, t);
+			h = _LOAD_i16(H0 + j);
 		}
-		for (k = 0; LIKELY(k < 16); ++k) {
-			f = _mm_slli_si128(f, 2);
+		for (k = 0; LIKELY(k < p); ++k) {
+			f = _SHIFT_L_i16(f);
 			for (j = 0; LIKELY(j < slen); ++j) {
-				h = _mm_load_si128(H1 + j);
-				h = _mm_max_epi16(h, f);
-				_mm_store_si128(H1 + j, h);
-				h = _mm_subs_epu16(h, oe_ins);
-				f = _mm_subs_epu16(f, e_ins);
-				if(UNLIKELY(!_mm_movemask_epi8(_mm_cmpgt_epi16(f, h)))) goto end_loop8;
+				h = _LOAD_i16(H1 + j);
+				h = _MAX_i16(h, f);
+				_STORE_i16(H1 + j, h);
+				h = _SUB_i16(h, oe_ins);
+				f = _SUB_i16(f, e_ins);
+				cmp = _CMP_LE_ALL_i16(f, h);
+				if (UNLIKELY(cmp)) goto end_loop_i16;
 			}
 		}
-end_loop8:
-		__max_8(imax, max);
+end_loop_i16:
+		imax = _MAX_V_i16(max);
 		if (imax >= minsc) {
 			if (n_b == 0 || (int32_t)b[n_b-1] + 1 != i) {
 				if (n_b == m_b) {
@@ -307,7 +383,7 @@ end_loop8:
 		if (imax > gmax) {
 			gmax = imax; te = i;
 			for (j = 0; LIKELY(j < slen); ++j)
-				_mm_store_si128(Hmax + j, _mm_load_si128(H1 + j));
+				_STORE_i16(Hmax + j, _LOAD_i16(H1 + j));
 			if (gmax >= endsc) break;
 		}
 		S = H1; H1 = H0; H0 = S;
@@ -317,8 +393,8 @@ end_loop8:
 		int max = -1, tmp, low, high, qlen = slen * 8;
 		uint16_t *t = (uint16_t*)Hmax;
 		for (i = 0, r.qe = -1; i < qlen; ++i, ++t)
-			if ((int)*t > max) max = *t, r.qe = i / 8 + i % 8 * slen;
-			else if ((int)*t == max && (tmp = i / 8 + i % 8 * slen) < r.qe) r.qe = tmp; 
+			if ((int)*t > max) max = *t, r.qe = i / p + i % p * slen;
+			else if ((int)*t == max && (tmp = i / p + i % p * slen) < r.qe) r.qe = tmp; 
 		if (b) {
 			i = (r.score + q->max - 1) / q->max;
 			low = te - i; high = te + i;
